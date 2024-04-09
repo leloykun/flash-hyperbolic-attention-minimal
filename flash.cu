@@ -43,6 +43,8 @@ void forward_kernel(
         __syncthreads();  // such that the inner loop can use the correct Kj, Vj
 
         for (int i = 0; i < Tr; i++)  {
+            if (i * Br + tx >= N)
+                break;  // break if we are done with the sequence
 
             // Load Qi to SRAM, l and m to registers
             for (int x = 0; x < d; x++) {
@@ -57,6 +59,8 @@ void forward_kernel(
             // with causal masking
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
+                if (j * Bc + y >= N)
+                    break;  // break if we are done with the sequence
                 float sum = 0;
                 for (int x = 0; x < d; x++) {
                     sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
@@ -75,6 +79,8 @@ void forward_kernel(
             // P[tx][y] = exp(S[tx][y] - row_m)
             float row_l = 0;
             for (int y = 0; y < Bc; y++) {
+                if (j * Bc + y >= N)
+                    break;  // break if we are done with the sequence
                 if (i * Br + tx < j * Bc + y)
                     S[(Bc * tx) + y] = 0;
                 else
@@ -90,6 +96,8 @@ void forward_kernel(
             for (int x = 0; x < d; x++) {
                 float pv = 0;  // Pij * Vj
                 for (int y = 0; y < Bc; y++) {
+                    if (j * Bc + y >= N)
+                        break;  // break if we are done with the sequence
                     pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                 }
                 O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
