@@ -24,6 +24,10 @@ print('=== profiling manual attention (forward pass) ===')
 # Our minimal flash attention aims to be faster than this by avoiding HBM read/writes of N^2 matrices.
 def manual_attn(q, k, v):
     att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))
+    # add casual mask
+    mask = torch.tril(torch.ones(att.size(-2), att.size(-1)), diagonal=0).cuda()
+    print(mask)
+    att = att.masked_fill(mask == 0, float('-inf'))
     att = F.softmax(att, dim=-1)
     y = att @ v
     return y

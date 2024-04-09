@@ -54,6 +54,7 @@ void forward_kernel(
             // S = QK^T, row_m = rowmax(S)
             // S[tx][y] = Sum_{x = 0}^{d-1} {Qi[tx][x] * Kj[y][x]}
             // row_m = Max_{y = 0}^{Bc-1} S[tx][y]
+            // with causal masking
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
                 float sum = 0;
@@ -61,17 +62,23 @@ void forward_kernel(
                     sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
                 }
                 sum *= softmax_scale;
+                if (i * Br + tx < j * Bc + y)
+                    sum = -INFINITY;
                 S[(Bc * tx) + y] = sum;
 
                 if (sum > row_m)
                     row_m = sum;
             }
 
+            // implement softmax with causal masking
             // P = exp(S - row_m), row_l = rowsum(P)
             // P[tx][y] = exp(S[tx][y] - row_m)
             float row_l = 0;
             for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
+                if (i * Br + tx < j * Bc + y)
+                    S[(Bc * tx) + y] = 0;
+                else
+                    S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
                 row_l += S[(Bc * tx) + y];
             }
 
@@ -178,13 +185,18 @@ void backward_kernel(
                     sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
                 }
                 sum *= softmax_scale;
+                if (i * Br + tx < j * Bc + y)
+                    sum = -INFINITY;
                 S[(Bc * tx) + y] = sum;
             }
 
             // Pij = diag(li)^-1 * exp(Sij - mi)
             // Pij[tx][y] = (1 / li[tx]) * exp(Sij[tx][y] - mi[tx])
             for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = (1 / l_curr) * __expf(S[(Bc * tx) + y] - m_curr);
+                if (i * Br + tx < j * Bc + y)
+                    S[(Bc * tx) + y] = 0;
+                else
+                    S[(Bc * tx) + y] = (1 / l_curr) * __expf(S[(Bc * tx) + y] - m_curr);
             }
 
             // dVj <- dVj + Pij^T * dOi
