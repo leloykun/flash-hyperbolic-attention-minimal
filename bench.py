@@ -5,7 +5,11 @@ from torch.nn import functional as F
 from torch.utils.cpp_extension import load
 
 # Load the CUDA kernel as a python module
-minimal_attn = load(name='minimal_attn', sources=['main.cpp', 'flash.cu'], extra_cuda_cflags=['-O2'])
+minimal_attn = load(
+    name='minimal_attn',
+    sources=['main.cpp', 'flash.cu', 'flash_2.cu'],
+    extra_cuda_cflags=['-O3', '--use_fast_math'],
+)
 
 # Use small model params, otherwise slower than manual attention. See caveats in README.
 batch_size = 16
@@ -46,6 +50,17 @@ print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
 print('attn values sanity check:', torch.allclose(minimal_result, manual_result, rtol=0, atol=1e-02))
 
+print('=== profiling minimal flash attention 2 (forward pass) === ')
+
+with (
+    torch.autograd.profiler.profile(use_cuda=True) as prof,
+    torch.no_grad(),
+):
+    minimal_result_2, L = minimal_attn.forward_2(q, k, v)
+print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+
+print('attn values sanity check:', torch.allclose(minimal_result_2, manual_result, rtol=0, atol=1e-02))
+
 print("\n\n\n")
 print('====== profiling backward pass ======')
 
@@ -69,6 +84,19 @@ with (
     torch.no_grad(),
 ):
     minimal_grad_q, minimal_grad_k, minimal_grad_v = minimal_attn.backward(q, k, v, minimal_result, y_grad, l, m)
+print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+
+print('q grad sanity check:', torch.allclose(manual_grad_q, minimal_grad_q, rtol=0, atol=1e-02))
+print('k grad sanity check:', torch.allclose(manual_grad_k, minimal_grad_k, rtol=0, atol=1e-02))
+print('v grad sanity check:', torch.allclose(manual_grad_v, minimal_grad_v, rtol=0, atol=1e-02))
+
+print('=== profiling minimal flash attention 2 (backward pass) === ')
+
+with (
+    torch.autograd.profiler.profile(use_cuda=True) as prof,
+    torch.no_grad(),
+):
+    minimal_grad_q, minimal_grad_k, minimal_grad_v = minimal_attn.backward_2(q, k, v, minimal_result_2, y_grad, L)
 print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
 print('q grad sanity check:', torch.allclose(manual_grad_q, minimal_grad_q, rtol=0, atol=1e-02))
