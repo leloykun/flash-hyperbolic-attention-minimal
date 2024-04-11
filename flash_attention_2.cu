@@ -45,12 +45,13 @@ void flash_attention_2_forward_kernel(
 
         // Causal mask: j <= i
         for (int j = 0; j <= i; ++j) {
+            __syncthreads();
             // Load Kj, Vj from HBM to SRAM
             for (int x = 0; x < d; x++) {
                 Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
                 Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
             }
-            
+            __syncthreads();
             // S_i^j = softmax_scale * QiKj^T
             // S_i^j[tx][y] = softmax_scale * Sum_{x = 0}^{d-1} Qi[tx][x] * Kj[y][x]
             float row_m = -INFINITY;
@@ -175,9 +176,8 @@ void flash_attention_2_backward_kernel(
             dVj[(tx * d) + x] = 0;
         }
 
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
         for (int i = j; i < Tr; i++)  {
-
+            __syncthreads();
             // Load Qi, Oi, dOi, dQi, li, mi to SRAM
             // Also load l, m to registers
             float Di = 0;
@@ -210,7 +210,7 @@ void flash_attention_2_backward_kernel(
                 else
                     S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - l_curr);
             }
-
+            __syncthreads();
             // dVj <- dVj + Pij^T * dOi
             // dVj[tx][x] = dVj[tx][x] + Sum_{y = 0}^{Br-1} Pij[y][tx] * dOi[tx][x]
             for (int x = 0; x < d; x++) {
@@ -247,7 +247,7 @@ void flash_attention_2_backward_kernel(
                 sum *= softmax_scale;
                 atomicAdd(&dQ[qkv_offset + (row_tile_size * i) + (tx * d) + x], sum);
             }
-
+            __syncthreads();
             // dKj <- dKj + softmax_scale * dSij^TQi
             // dKj[tx][x] = dKj[tx][x] + softmax_scale * Sum_{y = 0}^{Br-1} dSij[y][tx] * Qi[y][x]
             for (int x = 0; x < d; x++) {
@@ -259,15 +259,12 @@ void flash_attention_2_backward_kernel(
                 atomicAdd(&dKj[(tx * d) + x], sum);
             }
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
 
         // Upload Kj, Vj to HRAM
         for (int x = 0; x < d; x++) {
             dK[qkv_offset + (row_tile_size * j) + (tx * d) + x] = dKj[(tx * d) + x];
             dV[qkv_offset + (row_tile_size * j) + (tx * d) + x] = dVj[(tx * d) + x];
         }
-
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
 

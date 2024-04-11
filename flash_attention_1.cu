@@ -172,9 +172,8 @@ void backward_kernel(
             dVj[(tx * d) + x] = 0;
         }
 
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
         for (int i = j; i < Tr; i++)  {
-
+            __syncthreads();
             // Load Qi, Oi, dOi, dQi, li, mi to SRAM
             // Also load l, m to registers
             for (int x = 0; x < d; x++) {
@@ -206,7 +205,7 @@ void backward_kernel(
                 else
                     S[(Bc * tx) + y] = (1 / l_curr) * __expf(S[(Bc * tx) + y] - m_curr);
             }
-
+            __syncthreads();
             // dVj <- dVj + Pij^T * dOi
             // dVj[tx][x] = dVj[tx][x] + Sum_{y = 0}^{Br-1} Pij[y][tx] * dOi[tx][x]
             for (int x = 0; x < d; x++) {
@@ -250,7 +249,7 @@ void backward_kernel(
                 sum *= softmax_scale;
                 atomicAdd(&dQ[qkv_offset + (row_tile_size * i) + (tx * d) + x], sum);
             }
-
+            __syncthreads();
             // dKj <- dKj + softmax_scale * dSij^TQi
             // dKj[tx][x] = dKj[tx][x] + softmax_scale * Sum_{y = 0}^{Br-1} dSij[y][tx] * Qi[y][x]
             for (int x = 0; x < d; x++) {
@@ -262,15 +261,12 @@ void backward_kernel(
                 atomicAdd(&dKj[(tx * d) + x], sum);
             }
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
 
         // Upload Kj, Vj to HRAM
         for (int x = 0; x < d; x++) {
             dK[qkv_offset + (row_tile_size * j) + (tx * d) + x] = dKj[(tx * d) + x];
             dV[qkv_offset + (row_tile_size * j) + (tx * d) + x] = dVj[(tx * d) + x];
         }
-
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
 
