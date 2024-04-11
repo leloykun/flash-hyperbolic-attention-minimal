@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 
 __global__
-void forward_kernel(
+void flash_attention_2_forward_kernel(
     const float* Q,
     const float* K,
     const float* V,
@@ -14,16 +14,15 @@ void forward_kernel(
     const int Bc,
     const int Br,
     const float softmax_scale,
-    float* l,
-    float* m,
+    float* L,
     float* O
 ) {
     int tx = threadIdx.x;
     int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
 
-    // Offset into Q,K,V,O,l,m - different for each batch and head
+    // Offset into Q,K,V,O - different for each batch and head
     int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
+    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for L
 
     // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
@@ -33,93 +32,97 @@ void forward_kernel(
     float* Vj = &sram[tile_size * 2];
     float* S = &sram[tile_size * 3];
 
-    for (int j = 0; j < Tc; j++) {
+    for (int i = 0; i < Tr; ++i) {
+        if (i * Br + tx >= N)
+            break;  // break if we are done with the sequence
 
-        // Load Kj, Vj to SRAM
+        // Load Qi from HBM to SRAM, l and m to registers
         for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+            Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
         }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        float row_m_prev = -INFINITY;
+        float row_l_prev = 0;
 
-        for (int i = j; i < Tr; i++)  {
-            if (i * Br + tx >= N)
-                break;  // break if we are done with the sequence
-
-            // Load Qi to SRAM, l and m to registers
+        // Causal mask: j <= i
+        for (int j = 0; j <= i; ++j) {
+            // Load Kj, Vj from HBM to SRAM
             for (int x = 0; x < d; x++) {
-                Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+                Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
+                Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
             }
-            float row_m_prev = m[lm_offset + (Br * i) + tx];
-            float row_l_prev = l[lm_offset + (Br * i) + tx];
-
-            // S = QK^T, row_m = rowmax(S)
-            // S[tx][y] = Sum_{x = 0}^{d-1} {Qi[tx][x] * Kj[y][x]}
-            // row_m = Max_{y = 0}^{Bc-1} S[tx][y]
-            // with causal masking
+            
+            // S_i^j = softmax_scale * QiKj^T
+            // S_i^j[tx][y] = softmax_scale * Sum_{x = 0}^{d-1} Qi[tx][x] * Kj[y][x]
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
                 if (j * Bc + y >= N)
                     break;  // break if we are done with the sequence
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= softmax_scale;
                 if (i * Br + tx < j * Bc + y)
-                    sum = -INFINITY;
+                    break;
+                float sum = 0;
+                for (int x = 0; x < d; x++)
+                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+                sum *= softmax_scale;
                 S[(Bc * tx) + y] = sum;
 
                 if (sum > row_m)
                     row_m = sum;
             }
 
-            // implement softmax with causal masking
-            // P = exp(S - row_m), row_l = rowsum(P)
-            // P[tx][y] = exp(S[tx][y] - row_m)
+            // m_i^j = max(m_i^j-1, row_max(S_i^j))
+            float new_row_m = max(row_m_prev, row_m);
+
+            // P_i^j = exp(S_i^j - m_i^j)
+            // P_i^j[tx][y] = exp(S_i^j[tx][y] - m_i^j)
             float row_l = 0;
             for (int y = 0; y < Bc; y++) {
                 if (j * Bc + y >= N)
                     break;  // break if we are done with the sequence
                 if (i * Br + tx < j * Bc + y)
-                    S[(Bc * tx) + y] = 0;
-                else
-                    S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
+                    break;
+                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - new_row_m);
                 row_l += S[(Bc * tx) + y];
             }
 
-            // Compute new m and l
-            float row_m_new = max(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+            // l_i^j = (exp(m_i^j-1 - m_i^j) * l_i^j-1) + row_sum(P_i^j)
+            float row_m_exp = __expf(row_m_prev - new_row_m);
+            float new_row_l = (row_m_exp * row_l_prev) + row_l;
 
-            // Write O, l, m to HBM
+            // O_i^j = diag(exp(m_i^j-1 - m_i^j))^-1 * O_i^j-1 + P_i^jVj
             for (int x = 0; x < d; x++) {
                 float pv = 0;  // Pij * Vj
                 for (int y = 0; y < Bc; y++) {
                     if (j * Bc + y >= N)
                         break;  // break if we are done with the sequence
+                    if (i * Br + tx < j * Bc + y)
+                        break;
                     pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                 }
-                O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
-                    * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
-                    + (__expf(row_m - row_m_new) * pv));
+                O[qkv_offset + (tile_size * i) + (tx * d) + x] = \
+                    row_m_exp * O[qkv_offset + (tile_size * i) + (tx * d) + x] + pv;
             }
-            m[lm_offset + (Br * i) + tx] = row_m_new;
-            l[lm_offset + (Br * i) + tx] = row_l_new;
+
+            // Update m and l
+            row_m_prev = new_row_m;
+            row_l_prev = new_row_l;
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+
+        // O_i = diag(l_i^{Tc})^-1 * O_i^{Tc}
+        for (int x = 0; x < d; x++)
+            O[qkv_offset + (tile_size * i) + (tx * d) + x] /= row_l_prev;
+        // L_i = m_i^{Tc} + log(l_i^{Tc})
+        L[lm_offset + (Br * i) + tx] = row_m_prev + __logf(row_l_prev);
     }
 }
 
 __global__
-void backward_kernel(
+void flash_attention_2_backward_kernel(
     const float* Q,
     const float* K,
     const float* V,
     const float* O,
     const float* dO,
-    const float* l,
-    const float* m,
+    const float* L,
     const int N,
     const int d,
     const int Tc,
@@ -134,9 +137,9 @@ void backward_kernel(
     int tx = threadIdx.x;
     int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
 
-    // Offset into Q,K,V,O,l,m - different for each batch and head
+    // Offset into Q,K,V,O - different for each batch and head
     int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
+    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for L
 
     // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
@@ -177,13 +180,14 @@ void backward_kernel(
 
             // Load Qi, Oi, dOi, dQi, li, mi to SRAM
             // Also load l, m to registers
+            float Di = 0;
             for (int x = 0; x < d; x++) {
                 Qi[(tx * d) + x] = Q[qkv_offset + (row_tile_size * i) + (tx * d) + x];
                 Oi[(tx * d) + x] = O[qkv_offset + (row_tile_size * i) + (tx * d) + x];
                 dOi[(tx * d) + x] = dO[qkv_offset + (row_tile_size * i) + (tx * d) + x];
+                Di += dOi[(tx * d) + x] * Oi[(tx * d) + x];
             }
-            float m_curr = m[lm_offset + (Br * i) + tx];
-            float l_curr = l[lm_offset + (Br * i) + tx];
+            float l_curr = L[lm_offset + (Br * i) + tx];
 
             // Sij = softmax_scale * QiKj^T
             // Sij[tx][y] = softmax_scale * Sum_{y = 0}^{Bc-1} Qi[tx][x] * Kj[y][x]
@@ -204,7 +208,7 @@ void backward_kernel(
                 if (i * Br + tx < j * Bc + y)
                     S[(Bc * tx) + y] = 0;
                 else
-                    S[(Bc * tx) + y] = (1 / l_curr) * __expf(S[(Bc * tx) + y] - m_curr);
+                    S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - l_curr);
             }
 
             // dVj <- dVj + Pij^T * dOi
@@ -225,13 +229,6 @@ void backward_kernel(
                     sum += dOi[(tx * d) + x] * Vj[(y * d) + x];
                 }
                 dS[(Bc * tx) + y] = sum;
-            }
-
-            // Di <- rowsum(dOi * Oi)  (pointwise multiply)
-            // Di[tx] = Sum_{x = 0}^{d-1} dOi[tx][x] * Oi[tx][x]
-            float Di = 0;
-            for (int x = 0; x < d; x++) {
-                Di += dOi[(tx * d) + x] * Oi[(tx * d) + x];
             }
 
             // dSij <- Pij * (dPij - Di)
@@ -274,7 +271,7 @@ void backward_kernel(
     }
 }
 
-std::vector<torch::Tensor> forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+std::vector<torch::Tensor> flash_attention_2_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     // TODO: determine Bc, Br dynamically
     const int Bc = 32; const int Br = 32;
 
@@ -284,12 +281,11 @@ std::vector<torch::Tensor> forward(torch::Tensor Q, torch::Tensor K, torch::Tens
     const int Tc = ceil((float) N / Bc); const int Tr = ceil((float) N / Br);
     const float softmax_scale = 1.0 / sqrt(d);
 
-    // Initialize O, l, m to HBM
+    // Initialize O, L to HBM
     auto O = torch::zeros_like(Q);
-    auto l = torch::zeros({B, nh, N});
-    auto m = torch::full({B, nh, N}, -INFINITY);
+    auto L = torch::zeros({B, nh, N});
     torch::Device device(torch::kCUDA);
-    l = l.to(device); m = m.to(device);
+    L = L.to(device);
 
     // Calculate SRAM size needed per block
     int col_tile_size = Bc * d;  // size of Kj, Vj
@@ -305,22 +301,21 @@ std::vector<torch::Tensor> forward(torch::Tensor Q, torch::Tensor K, torch::Tens
     dim3 grid_dim(B, nh);  // batch_size x num_heads
     dim3 block_dim(Br);  // Br threads per block
 
-    forward_kernel<<<grid_dim, block_dim, sram_size>>>(
+    flash_attention_2_forward_kernel<<<grid_dim, block_dim, sram_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
         N, d, Tc, Tr, Bc, Br, softmax_scale,
-        l.data_ptr<float>(), m.data_ptr<float>(), O.data_ptr<float>()
+        L.data_ptr<float>(), O.data_ptr<float>()
     );
-    return {O, l, m};
+    return {O, L};
 }
 
-std::vector<torch::Tensor> backward(
+std::vector<torch::Tensor> flash_attention_2_backward(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
     torch::Tensor dO,
-    torch::Tensor l,
-    torch::Tensor m
+    torch::Tensor L
 ) {
     // TODO: determine Bc, Br dynamically
     const int Bc = 16; const int Br = 16;
@@ -349,10 +344,10 @@ std::vector<torch::Tensor> backward(
     dim3 grid_dim(B, nh);  // batch_size x num_heads
     dim3 block_dim(Br);  // Bc threads per block
 
-    backward_kernel<<<grid_dim, block_dim, sram_size>>>(
+    flash_attention_2_backward_kernel<<<grid_dim, block_dim, sram_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
         O.data_ptr<float>(), dO.data_ptr<float>(),
-        l.data_ptr<float>(), m.data_ptr<float>(),
+        L.data_ptr<float>(),
         N, d, Tc, Tr, Bc, Br, softmax_scale,
         dQ.data_ptr<float>(), dK.data_ptr<float>(), dV.data_ptr<float>()
     );

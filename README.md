@@ -1,10 +1,9 @@
-# flash-attention-minimal
+# Flash Hyperbolic Attention Minimal
 
-A minimal re-implementation of Flash Attention with CUDA and PyTorch.
-The official [implementation](https://github.com/Dao-AILab/flash-attention) can be quite daunting for a CUDA beginner
-(like myself), so this repo tries to be small and educational.
+A minimal re-implementation of Flash Attention with CUDA and PyTorch. The official [implementation](https://github.com/Dao-AILab/flash-attention) can be quite daunting for a CUDA beginner (like myself), so this repo tries to be small and educational.
 
-* The entire forward pass is written in ~100 lines in `flash.cu`.
+* The end goal of this repo is to implement Flash Attention-like kernels for the various hyperbolic attention algorithms, finally making them production-ready.
+* This was forked from [Peter Kim](https://github.com/tspeterkim)'s [flash-attention-minimal](https://github.com/tspeterkim/flash-attention-minimal) repo.
 * The variable names follow the notations from the original [paper](https://arxiv.org/abs/2205.14135).
 
 ## Usage
@@ -22,38 +21,47 @@ Compare the wall-clock time between manual attention and minimal flash attention
 python bench.py
 ```
 
-Sample output on a [T4](https://aws.amazon.com/ec2/instance-types/g4/) for the forward pass (Br = Bc = 32):
+Sample output on an RTX 3060 for the forward pass (Br = Bc = 32):
 
-```
+```bash
 === profiling manual attention (forward pass) ===
 ...
-Self CPU time total: 52.389ms
-Self CUDA time total: 52.545ms
+Self CPU time total: 375.381ms
+Self CUDA time total: 377.542ms
 
-=== profiling minimal flash attention (forward pass) === 
+=== profiling minimal flash attention 1 (forward pass) ===
 ...
-Self CPU time total: 11.452ms
-Self CUDA time total: 3.908ms
+Self CPU time total: 527.162ms
+Self CUDA time total: 108.211ms
+
+=== profiling minimal flash attention 2 (forward pass) ===
+...
+Self CPU time total: 343.248ms
+Self CUDA time total: 4.048ms
 ```
 
-That's a 13x speedup!
+That's a 3.5x & 94x speedup for Flash Attention 1 & 2, respectively!
 
 Sample output on an RTX 3060 for the backward pass (Br = Bc = 16):
 
-```
+```bash
 === profiling manual attention (backward pass) ===
 ...
-Self CPU time total: 11.139ms
-Self CUDA time total: 1.721ms
+Self CPU time total: 65.457ms
+Self CUDA time total: 67.838ms
 
-=== profiling minimal flash attention (backward pass) === 
+=== profiling minimal flash attention 1 (backward pass) === 
 ...
-Self CPU time total: 31.466ms
-Self CUDA time total: 629.000us
+Self CPU time total: 1.013s
+Self CUDA time total: 4.615ms
+
+=== profiling minimal flash attention 2 (backward pass) === 
+...
+Self CPU time total: 1.023s
+Self CUDA time total: 814.000us
 ```
 
-That's a 2x speedup! Note though that we've only tested this on an RTX 3060 which has a smaller SRAM than the T4
-(hence the reduction of block size from 32 to 16). The speedup might be different on a T4.
+That's a 15x & 83x speedup for Flash Attention 1 & 2, respectively!
 
 ### I don't have a GPU
 
@@ -74,5 +82,5 @@ sequences and larger block sizes, this gets slower than the manual implementatio
 
 ## Contributors
 
-* [Peter Kim](https://github.com/tspeterkim), Lead Contributor
-* [Franz Cesista](https://github.com/leloykun), Implemented the backward pass
+* [Franz Cesista](https://github.com/leloykun), Implemented the backward pass for the Flash Attention 1 algorithm & both the forward and backward passes for the Flash Attention 2 algorithm.
+* [Peter Kim](https://github.com/tspeterkim), Implemented the forward pass for the minimal Flash Attention 1 algorithm. See [original repo](https://github.com/tspeterkim/flash-attention-minimal)
