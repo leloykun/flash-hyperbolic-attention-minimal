@@ -1,0 +1,50 @@
+on: [push]
+
+jobs:
+  check_drf:
+    env:
+      B: 64
+      NH: 64
+    runs-on: ubuntu-latest
+    name: Setup faial
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v1
+    - name: Download faial and setup path
+      uses: cogumbreiro/setup-faial@v1.0
+    - name: Check flash_attention_2_backward_kernel
+      run: |
+        faial-drf \
+        -p Bc=16 \
+        -p Br=16 \
+        --blockDim=16 \
+        --gridDim=[$B,$NH] \
+        --kernel=flash_attention_2_backward_kernel \
+        flash_attention_2.cu
+    - name: Check flash_attention_2_forward_kernel
+      run: |
+        faial-drf \
+        -p Bc=32 \
+        -p Br=32 \
+        --blockDim=32 \
+        --gridDim=[$B,$NH] \
+        --kernel=flash_attention_2_forward_kernel \
+        flash_attention_2.cu
+    - name: Check backward_kernel
+      run: |
+        faial-drf \
+          -p Bc=16 \
+          -p Br=16 \
+          --blockDim=16 \
+          --gridDim=[$B,$NH] \
+          --kernel=backward_kernel \
+          flash_attention_1.cu
+    - name: Check forward_kernel
+      run: |
+        faial-drf \
+          -p Bc=32 \
+          -p Br=32 \
+          --blockDim=32 \
+          --gridDim=[$B,$NH] \
+          --kernel=forward_kernel \
+          flash_attention_1.cu
